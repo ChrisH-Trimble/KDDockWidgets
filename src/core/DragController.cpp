@@ -24,6 +24,7 @@
 #include "core/Platform.h"
 #include "core/Group.h"
 #include "core/FloatingWindow.h"
+#include "core/MainWindow.h"
 #include "core/DockWidget_p.h"
 #include "core/ScopedValueRollback_p.h"
 
@@ -925,12 +926,94 @@ static std::shared_ptr<View> qtTopLevelForHWND(HWND hwnd)
     return nullptr;
 }
 
-#endif
+#endif // KDDW_FRONTEND_QT_WINDOWS
 
+static DropArea *deepestDropAreaInTopLevel(std::shared_ptr<View> topLevel, Point globalPos,
+                                           const Vector<QString> &affinities);
+
+// Calls into the application's dropIndicatorAllowedFunc to let the client decide if the given
+// source window is permitted to dock.
+static bool clientRefusesAllDrops(DropArea *dropArea, Point globalPos,
+                                  WindowBeingDragged *windowBeingDragged)
+{
+    auto allowedFunc = Config::self().dropIndicatorAllowedFunc();
+    if (!allowedFunc || !windowBeingDragged)
+        return false;
+
+    // Early return for reentrant calls
+    static bool s_asking = false;
+    if (s_asking)
+        return false;
+    ScopedValueRollback guard(s_asking, true);
+
+    const Core::DockWidget::List source = windowBeingDragged->dockWidgets();
+
+    Core::Group *hovered = nullptr;
+    const Core::Group::List groups = dropArea->groups();
+    for (Core::Group *group : groups) {
+        if (group->containsMouse(globalPos)) {
+            hovered = group;
+            break;
+        }
+    }
+    const Core::DockWidget::List target =
+        hovered ? hovered->dockWidgets() : Core::DockWidget::List();
+
+    // Only the individual locations, not the Inner/Outter/Horizontal/Vertical composites - apps
+    // mask the argument, so a composite would report true for a location they meant to refuse.
+    static const DropLocation locations[] = { DropLocation_Left,       DropLocation_Top,
+                                             DropLocation_Right,      DropLocation_Bottom,
+                                             DropLocation_Center,     DropLocation_OutterLeft,
+                                             DropLocation_OutterTop,  DropLocation_OutterRight,
+                                             DropLocation_OutterBottom };
+
+    for (DropLocation loc : locations) {
+        if (allowedFunc(loc, source, target, dropArea))
+            return false;
+    }
+
+    return true;
+}
+
+// Tests if the given top-level is a valid drop target for the dragged window. Main windows always
+// are. Otherwise the window must not forbid drops, affinities must match, the cursor must be over one
+// of its drop areas rather than its title bar or margins, and finally the client must okay the drop.
+static bool canHostDrop(const std::shared_ptr<View> &topLevel, Point globalPos,
+                        const Vector<QString> &affinities,
+                        WindowBeingDragged *windowBeingDragged)
+{
+    const auto mainWindows = DockRegistry::self()->mainwindows();
+    for (Core::MainWindow *mw : mainWindows) {
+        if (mw->view()->rootView()->equals(topLevel))
+            return true;
+    }
+
+    if (auto fw = topLevel->asFloatingWindowController()) {
+        if (fw->anyNoDrops())
+            return false;
+
+        if (!DockRegistry::self()->affinitiesMatch(fw->affinities(), affinities))
+            return false;
+    }
+
+    DropArea *dropArea = deepestDropAreaInTopLevel(topLevel, globalPos, affinities);
+    if (!dropArea)
+        return false;
+
+    return !clientRefusesAllDrops(dropArea, globalPos, windowBeingDragged);
+}
+
+// Added the window being dragged so we can test affinities and client approval before locking a
+// window in as the drop target.
 static std::shared_ptr<View> qtTopLevelUnderCursor_impl(Point globalPos,
                                                         const Window::List &windows,
-                                                        View *rootViewBeingDragged)
+                                                        View *rootViewBeingDragged,
+                                                        WindowBeingDragged *windowBeingDragged)
 {
+    const Vector<QString> affinities = windowBeingDragged && windowBeingDragged->floatingWindow()
+        ? windowBeingDragged->floatingWindow()->affinities()
+        : Vector<QString>();
+
     for (auto i = windows.size() - 1; i >= 0; --i) {
         const Window::Ptr &window = windows.at(i);
         auto tl = window->rootView(/*v1Workaround=*/false);
@@ -941,7 +1024,8 @@ static std::shared_ptr<View> qtTopLevelUnderCursor_impl(Point globalPos,
         if (rootViewBeingDragged && rootViewBeingDragged->window()->equals(window))
             continue;
 
-        if (window->geometry().contains(globalPos)) {
+        if (window->geometry().contains(globalPos)
+            && canHostDrop(tl, globalPos, affinities, windowBeingDragged)) {
             KDDW_TRACE("Found top-level {}", ( void * )tl.get());
             return tl;
         }
@@ -963,6 +1047,7 @@ std::shared_ptr<View> DragController::qtTopLevelUnderCursor() const
         // There might be windows that don't belong to our app in between, so use win32 to travel by
         // z-order. Another solution is to set a parent on all top-levels. But this code is
         // orthogonal.
+        const Vector<QString> affinities = m_windowBeingDragged->floatingWindow()->affinities();
         HWND hwnd = HWND(m_windowBeingDragged->floatingWindow()->view()->window()->handle());
         while (hwnd) {
             hwnd = GetWindow(hwnd, GW_HWNDNEXT);
@@ -976,8 +1061,12 @@ std::shared_ptr<View> DragController::qtTopLevelUnderCursor() const
             if (auto tl = qtTopLevelForHWND(hwnd)) {
                 const Rect windowGeometry = tl->d->windowGeometry();
 
+                // Being under the cursor isn't enough to own the drop - see canHostDrop(). If this
+                // top-level can't host it, keep walking, since the window the user is aiming at is
+                // very likely below it.
                 if (windowGeometry.contains(globalPos)
-                    && tl->viewName() != QStringLiteral("_docks_IndicatorWindow_Overlay")) {
+                    && tl->viewName() != QStringLiteral("_docks_IndicatorWindow_Overlay")
+                    && canHostDrop(tl, globalPos, affinities, m_windowBeingDragged.get())) {
                     KDDW_TRACE("Found top-level {}", ( void * )tl.get());
                     return tl;
                 }
@@ -1014,8 +1103,9 @@ std::shared_ptr<View> DragController::qtTopLevelUnderCursor() const
         bool ok = false;
         const Window::List orderedWindows = KDDockWidgets::orderedWindows(ok);
         FloatingWindow *tlwBeingDragged = m_windowBeingDragged->floatingWindow();
-        if (auto tl =
-                qtTopLevelUnderCursor_impl(globalPos, orderedWindows, tlwBeingDragged->view()))
+        if (auto tl = qtTopLevelUnderCursor_impl(globalPos, orderedWindows,
+                                                 tlwBeingDragged->view(),
+                                                 m_windowBeingDragged.get()))
             return tl;
 
         if (!ok) {
@@ -1032,11 +1122,13 @@ std::shared_ptr<View> DragController::qtTopLevelUnderCursor() const
         FloatingWindow *floatingWindow = m_windowBeingDragged->floatingWindow();
         if (floatingWindow) {
             if (auto tl = qtTopLevelUnderCursor_impl(
-                    globalPos, DockRegistry::self()->floatingQWindows(/*excludeNoDrops=*/true), floatingWindow->view()))
+                    globalPos, DockRegistry::self()->floatingQWindows(/*excludeNoDrops=*/true),
+                    floatingWindow->view(), m_windowBeingDragged.get()))
                 return tl;
 
             return qtTopLevelUnderCursor_impl(
-                globalPos, DockRegistry::self()->topLevels(/*excludeFloatingDocks=*/true), floatingWindow->view());
+                globalPos, DockRegistry::self()->topLevels(/*excludeFloatingDocks=*/true),
+                floatingWindow->view(), m_windowBeingDragged.get());
         }
     }
 
